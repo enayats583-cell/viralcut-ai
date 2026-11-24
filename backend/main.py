@@ -1,146 +1,352 @@
-import os
-import re
-import json
+
+from pathlib import Path
+from urllib.parse import urlparse
+import shutil
 import subprocess
 import uuid
-from pathlib import Path
+import re
 
-import requests
-from fastapi import FastAPI, HTTPException
+import yt_dlp
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
+from pydantic import BaseModel, Field
 
 BASE = Path(__file__).resolve().parent.parent
 UPLOADS = BASE / "uploads"
 OUTPUTS = BASE / "outputs"
+DOWNLOADS = BASE / "downloads"
+FRONTEND = BASE / "frontend"
 
-UPLOADS.mkdir(exist_ok=True)
-OUTPUTS.mkdir(exist_ok=True)
+for folder in (UPLOADS, OUTPUTS, DOWNLOADS):
+    folder.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="ViralCut AI")
-app.mount("/static", StaticFiles(directory=BASE / "frontend"), name="static")
+app = FastAPI(title="ViralCut AI", version="2.0")
+
+if FRONTEND.exists():
+    app.mount(
+        "/static",
+        StaticFiles(directory=FRONTEND),
+        name="static"
+    )
 
 
 class LinkRequest(BaseModel):
     url: str
-    duration: int = 30
+    start: float = Field(default=0, ge=0)
+    duration: float = Field(default=30, gt=0, le=180)
     aspect: str = "9:16"
 
 
-def extract_video_id(url: str) -> str:
-    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
-    if not match:
-        raise HTTPException(400, "Sahi YouTube link paste karo.")
-    return match.group(1)
+class BatchRequest(BaseModel):
+    job_id: str
+    clip_duration: float = Field(default=30, gt=0, le=180)
+    aspect: str = "9:16"
+    start: float = Field(default=0, ge=0)
+    end: float | None = Field(default=None, gt=0)
 
 
-def find_viral_start_time(video_id: str, duration: int) -> tuple[int, str]:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return 30, "Default clip (GEMINI_API_KEY set nahi hai)"
+class EditRequest(BaseModel):
+    job_id: str
+    start: float = Field(default=0, ge=0)
+    duration: float = Field(default=30, gt=0, le=180)
+    aspect: str = "9:16"
 
+
+RATIOS = {
+    "9:16": "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
+    "16:9": "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
+    "1:1": "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080"
+}
+
+
+def check_aspect(aspect):
+    if aspect not in RATIOS:
+        raise HTTPException(400, "Invalid video format")
+    return RATIOS[aspect]
+
+
+def safe_video(job_id):
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        raise HTTPException(400, "Invalid job ID")
+
+    files = list(UPLOADS.glob(f"{job_id}.*"))
+    files += list(DOWNLOADS.glob(f"{job_id}.*"))
+
+    if not files:
+        raise HTTPException(404, "Video not found")
+
+    return files[0]
+
+
+def video_duration(path):
     try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "hi"])
-        text_lines = [f"[{int(t['start'])}s] {t['text']}" for t in transcript[:250]]
-        transcript_text = "\n".join(text_lines)
-    except Exception:
-        return 30, "Captions nahi mile, default 30s se clip banayi"
-
-    prompt = (
-        f"You are a viral short-form video editor. Read this YouTube transcript with timestamps "
-        f"and pick the SINGLE most engaging, viral {duration}-second moment.\n"
-        f'Return ONLY valid JSON like: {{"start": 120, "reason": "Funny clutch moment"}}\n\n'
-        f"{transcript_text}"
-    )
-
-    try:
-        res = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=25,
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30
         )
-        raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(match.group(0))
-        return max(0, int(data.get("start", 30))), str(data.get("reason", "AI selected moment"))
+        if result.returncode != 0:
+            raise ValueError("Cannot read video duration")
+        return float(result.stdout.strip())
     except Exception:
-        return 30, "AI busy tha, default 30s se clip banayi"
+        raise HTTPException(500, "FFprobe error or invalid video")
+
+
+def make_clip(source, output, start, duration, aspect):
+    video_filter = check_aspect(aspect)
+
+    command = [
+        "ffmpeg", "-y",
+        "-ss", str(start),
+        "-i", str(source),
+        "-t", str(duration),
+        "-vf", video_filter,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        str(output)
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=900
+        )
+    except FileNotFoundError:
+        raise HTTPException(500, "FFmpeg is not installed")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Video processing timed out")
+
+    if result.returncode != 0:
+        raise HTTPException(500, result.stderr[-1500:])
+
+    return output
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return (BASE / "frontend" / "index.html").read_text(encoding="utf-8")
+    index = FRONTEND / "index.html"
+    if not index.exists():
+        return "<h1>ViralCut AI Backend Running</h1>"
+    return index.read_text(encoding="utf-8")
 
 
-@app.get("/health")
+@app.get("/api/health")
 def health():
-    return {"status": "ok", "app": "ViralCut AI"}
-
-
-@app.post("/api/auto-clip")
-def auto_clip(req: LinkRequest):
-    if req.duration <= 0 or req.duration > 180:
-        raise HTTPException(400, "Duration 1 se 180 seconds ke beech rakho.")
-
-    ratios = {
-        "9:16": "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
-        "16:9": "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720",
-        "1:1": "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080",
+    return {
+        "status": "ok",
+        "app": "ViralCut AI",
+        "version": "2.0"
     }
-    if req.aspect not in ratios:
-        raise HTTPException(400, "Invalid aspect ratio.")
 
-    video_id = extract_video_id(req.url)
-    start_sec, reason = find_viral_start_time(video_id, req.duration)
-    end_sec = start_sec + req.duration
+
+@app.post("/api/upload")
+async def upload_video(file: UploadFile = File(...)):
+    suffix = Path(file.filename or "video.mp4").suffix.lower()
+
+    if suffix not in [".mp4", ".mov", ".mkv", ".webm"]:
+        raise HTTPException(400, "Unsupported video format")
 
     job_id = uuid.uuid4().hex
-    raw_file = UPLOADS / f"{job_id}.mp4"
-    out_file = OUTPUTS / f"{job_id}.mp4"
+    destination = UPLOADS / f"{job_id}{suffix}"
 
-    # Sirf zaroori hissa download karo taaki server fast chale
-    dl_cmd = [
-        "yt-dlp",
-        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best",
-        "--download-sections", f"*{start_sec}-{end_sec}",
-        "--force-keyframes-at-cuts",
-        "--merge-output-format", "mp4",
-        "-o", str(raw_file),
-        req.url,
-    ]
-    dl = subprocess.run(dl_cmd, capture_output=True, text=True)
-    if dl.returncode != 0 or not raw_file.exists():
-        raise HTTPException(500, f"Video download fail hua: {dl.stderr[-250:]}")
-
-    # 9:16 / 16:9 / 1:1 crop karo
-    ff_cmd = [
-        "ffmpeg", "-y",
-        "-i", str(raw_file),
-        "-t", str(req.duration),
-        "-vf", ratios[req.aspect],
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-c:a", "aac",
-        str(out_file),
-    ]
-    ff = subprocess.run(ff_cmd, capture_output=True, text=True)
-    raw_file.unlink(missing_ok=True)
-
-    if ff.returncode != 0 or not out_file.exists():
-        raise HTTPException(500, "FFmpeg clip processing fail hua.")
+    try:
+        with destination.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    finally:
+        await file.close()
 
     return {
-        "download_url": f"/api/download/{job_id}",
-        "start_time": start_sec,
-        "reason": reason,
+        "job_id": job_id,
+        "message": "Upload complete"
     }
 
 
-@app.get("/api/download/{job_id}")
-def download_clip(job_id: str):
-    file_path = OUTPUTS / f"{job_id}.mp4"
-    if not file_path.exists():
-        raise HTTPException(404, "Clip nahi mili.")
-    return FileResponse(file_path, media_type="video/mp4", filename=f"viralcut_{job_id[:6]}.mp4")
+@app.post("/api/link")
+def download_link(request: LinkRequest):
+    parsed = urlparse(request.url)
+    host = (parsed.hostname or "").lower()
+
+    allowed = (
+        host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtu.be"
+        or host == "kick.com"
+        or host.endswith(".kick.com")
+    )
+
+    if parsed.scheme != "https" or not allowed:
+        raise HTTPException(400, "Only HTTPS YouTube and Kick links are allowed")
+
+    if parsed.username or parsed.password:
+        raise HTTPException(400, "Invalid URL")
+
+    check_aspect(request.aspect)
+
+    job_id = uuid.uuid4().hex
+    output = DOWNLOADS / f"{job_id}.mp4"
+
+    options = {
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "merge_output_format": "mp4",
+        "outtmpl": str(output),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "max_filesize": 2 * 1024 * 1024 * 1024
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            info = downloader.extract_info(request.url, download=True)
+
+        if info.get("is_live"):
+            output.unlink(missing_ok=True)
+            raise HTTPException(
+                400,
+                "Live streams need a separate live recording workflow. Use a completed VOD."
+            )
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        output.unlink(missing_ok=True)
+        raise HTTPException(400, f"Video download failed: {str(error)[:300]}")
+
+    if not output.exists():
+        raise HTTPException(500, "Downloaded video file not found")
+
+    return {
+        "job_id": job_id,
+        "title": info.get("title", "Video"),
+        "duration": info.get("duration"),
+        "message": "Video downloaded successfully"
+    }
+
+
+@app.post("/api/clip/{job_id}")
+def create_clip(
+    job_id: str,
+    start: float = 0,
+    duration: float = 30,
+    aspect: str = "9:16"
+):
+    source = safe_video(job_id)
+    length = video_duration(source)
+
+    if duration <= 0 or duration > 180:
+        raise HTTPException(400, "Clip duration must be 1–180 seconds")
+
+    if start < 0 or start >= length:
+        raise HTTPException(400, "Invalid start time")
+
+    duration = min(duration, length - start)
+    output = OUTPUTS / f"{uuid.uuid4().hex}.mp4"
+
+    make_clip(source, output, start, duration, aspect)
+
+    return {
+        "download_url": f"/api/download/{output.name}",
+        "filename": output.name
+    }
+
+
+@app.post("/api/batch")
+def create_batch(request: BatchRequest):
+    source = safe_video(request.job_id)
+    total = video_duration(source)
+    check_aspect(request.aspect)
+
+    end = min(request.end if request.end is not None else total, total)
+
+    if request.start >= end:
+        raise HTTPException(400, "Invalid video range")
+
+    clips = []
+    position = request.start
+
+    while position < end:
+        duration = min(request.clip_duration, end - position)
+        filename = f"{uuid.uuid4().hex}.mp4"
+        output = OUTPUTS / filename
+
+        make_clip(
+            source,
+            output,
+            position,
+            duration,
+            request.aspect
+        )
+
+        clips.append({
+            "filename": filename,
+            "start": round(position, 2),
+            "duration": round(duration, 2),
+            "download_url": f"/api/download/{filename}"
+        })
+
+        position += request.clip_duration
+
+    return {
+        "total_clips": len(clips),
+        "clips": clips,
+        "message": "Batch processing complete"
+    }
+
+
+@app.post("/api/edit")
+def edit_clip(request: EditRequest):
+    source = safe_video(request.job_id)
+    total = video_duration(source)
+
+    if request.start >= total:
+        raise HTTPException(400, "Invalid start time")
+
+    duration = min(request.duration, total - request.start)
+    filename = f"{uuid.uuid4().hex}.mp4"
+    output = OUTPUTS / filename
+
+    make_clip(
+        source,
+        output,
+        request.start,
+        duration,
+        request.aspect
+    )
+
+    return {
+        "filename": filename,
+        "download_url": f"/api/download/{filename}",
+        "message": "Edited clip created"
+    }
+
+
+@app.get("/api/download/{filename}")
+def download(filename: str):
+    if not re.fullmatch(r"[a-f0-9]{32}\.mp4", filename):
+        raise HTTPException(400, "Invalid filename")
+
+    path = OUTPUTS / filename
+
+    if not path.exists():
+        raise HTTPException(404, "Clip not found")
+
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=filename
+    )
     
