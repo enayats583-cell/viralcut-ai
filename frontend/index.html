@@ -1,0 +1,119 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ViralCut AI</title>
+<style>
+*{box-sizing:border-box}
+body{
+  margin:0;
+  padding:25px;
+  font-family:Arial,sans-serif;
+  background:#0d1020;
+  color:white;
+}
+main{
+  max-width:680px;
+  margin:auto;
+  padding:25px;
+  background:#171b31;
+  border-radius:18px;
+}
+h1{color:#a994ff}
+p{color:#b8bfdc}
+input,select,button{
+  width:100%;
+  padding:14px;
+  margin:9px 0;
+  border-radius:9px;
+  border:1px solid #41496d;
+  background:#0d1020;
+  color:white;
+}
+button{
+  background:#7357ff;
+  border:0;
+  font-weight:bold;
+}
+#status{margin-top:15px;word-break:break-word}
+</style>
+</head>
+<body>
+<main>
+<h1>ViralCut AI</h1>
+<p>Turn your long videos into short clips.</p>
+
+<label>Select Video</label>
+<input type="file" id="video" accept="video/*">
+
+<label>Start Time (Seconds)</label>
+<input type="number" id="start" value="0" min="0">
+
+<label>Clip Duration (Seconds)</label>
+<input type="number" id="duration" value="30" min="1" max="180">
+
+<label>Video Format</label>
+<select id="aspect">
+<option>9:16</option>
+<option>16:9</option>
+<option>1:1</option>
+</select>
+
+<button onclick="makeClip()">Create My Clip</button>
+
+<div id="status"></div>
+</main>
+
+<script>
+async function makeClip(){
+ const status=document.getElementById("status");
+ const file=document.getElementById("video").files[0];
+
+ if(!file){
+  status.textContent="Please select a video.";
+  return;
+ }
+
+ status.textContent="Uploading video...";
+
+ try{
+  const data=new FormData();
+  data.append("file",file);
+
+  const upload=await fetch("/api/upload",{
+   method:"POST",
+   body:data
+  });
+
+  const u=await upload.json();
+  if(!upload.ok) throw new Error(u.detail||"Upload failed");
+
+  status.textContent="Creating your clip...";
+
+  const params=new URLSearchParams({
+   start:document.getElementById("start").value,
+   duration:document.getElementById("duration").value,
+   aspect:document.getElementById("aspect").value
+  });
+
+  const response=await fetch(
+   "/api/clip/"+u.job_id+"?"+params,
+   {method:"POST"}
+  );
+
+  const result=await response.json();
+  if(!response.ok) throw new Error(result.detail||"Processing failed");
+
+  status.innerHTML=
+   'Your clip is ready! <a style="color:#a994ff" href="'+
+   result.download_url+'">Download Video</a>';
+
+ }catch(error){
+  status.textContent="Error: "+error.message;
+ }
+}
+</script>
+</body>
+</html>
